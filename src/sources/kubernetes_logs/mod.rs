@@ -74,6 +74,9 @@ use self::node_metadata_annotator::NodeMetadataAnnotator;
 use self::parser::Parser;
 use self::pod_metadata_annotator::PodMetadataAnnotator;
 
+use super::util::MultilineConfig;
+use crate::line_agg::{self, LineAgg};
+
 /// The `self_node_name` value env var key.
 const SELF_NODE_NAME_ENV_KEY: &str = "VECTOR_SELF_NODE_NAME";
 
@@ -197,7 +200,7 @@ pub struct Config {
     ///
     /// If your files share a common header that is not always a fixed size,
     ///
-    /// If the file has less than this amount of lines, it won’t be read at all.
+    /// If the file has less than this amount of lines, it won't be read at all.
     #[configurable(metadata(docs::type_unit = "lines"))]
     fingerprint_lines: usize,
 
@@ -258,6 +261,13 @@ pub struct Config {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[serde(default = "default_rotate_wait", rename = "rotate_wait_secs")]
     rotate_wait: Duration,
+
+    /// Multiline aggregation configuration.
+    ///
+    /// If not specified, multiline aggregation is disabled.
+    #[configurable(derived)]
+    #[serde(default)]
+    multiline: Option<MultilineConfig>,
 }
 
 const fn default_read_from() -> ReadFromConfig {
@@ -304,6 +314,7 @@ impl Default for Config {
             log_namespace: None,
             internal_metrics: Default::default(),
             rotate_wait: default_rotate_wait(),
+            multiline: None,
         }
     }
 }
@@ -560,6 +571,7 @@ struct Source {
     delay_deletion: Duration,
     include_file_metric_tag: bool,
     rotate_wait: Duration,
+    multiline: Option<MultilineConfig>,
 }
 
 impl Source {
@@ -648,6 +660,7 @@ impl Source {
             delay_deletion,
             include_file_metric_tag: config.internal_metrics.include_file_tag,
             rotate_wait: config.rotate_wait,
+            multiline: config.multiline.clone(),
         })
     }
 
@@ -683,6 +696,7 @@ impl Source {
             delay_deletion,
             include_file_metric_tag,
             rotate_wait,
+            multiline,
         } = self;
 
         let mut reflectors = Vec::new();
@@ -837,6 +851,20 @@ impl Source {
         let checkpoints = checkpointer.view();
         let events = file_source_rx.flat_map(futures::stream::iter);
         let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
+
+        // Apply multiline if configured
+        let events = if let Some(ref multiline_config) = multiline {
+            match multiline_config.try_into() {
+                Ok(config) => wrap_with_line_agg(events, config),
+                Err(err) => {
+                    error!(message = "Failed to parse multiline config", %err);
+                    Box::new(events)
+                }
+            }
+        } else {
+            Box::new(events)
+        };
+
         let events = events.map(move |line| {
             let byte_size = line.text.len();
             bytes_received.emit(ByteSize(byte_size));
@@ -1114,16 +1142,52 @@ fn prepare_label_selector(selector: &str) -> String {
     format!("{},{}", BUILT_IN, selector)
 }
 
+fn wrap_with_line_agg(
+    rx: impl Stream<Item = Line> + Send + std::marker::Unpin + 'static,
+    config: line_agg::Config,
+) -> Box<dyn Stream<Item = Line> + Send + std::marker::Unpin + 'static> {
+    let logic = line_agg::Logic::new(config);
+    Box::new(
+        LineAgg::new(
+            rx.map(|line| {
+                (
+                    line.filename,
+                    line.text,
+                    (line.file_id, line.start_offset, line.end_offset),
+                )
+            }),
+            logic,
+        )
+        .map(
+            |(filename, text, (file_id, start_offset, initial_end), lastline_context)| Line {
+                text,
+                filename,
+                file_id,
+                start_offset,
+                end_offset: lastline_context.map_or(initial_end, |(_, _, lastline_end_offset)| {
+                    lastline_end_offset
+                }),
+            },
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use similar_asserts::assert_eq;
     use vector_lib::lookup::{owned_value_path, OwnedTargetPath};
     use vector_lib::{config::LogNamespace, schema::Definition};
     use vrl::value::{kind::Collection, Kind};
+    use vector_lib::file_source::{Line, FileFingerprint};
+    use bytes::Bytes;
+    use std::time::Duration;
+    use futures::StreamExt;
+    use crate::line_agg;
+    use regex;
 
     use crate::config::SourceConfig;
 
-    use super::Config;
+    use super::{Config, wrap_with_line_agg};
 
     #[test]
     fn generate_config() {
@@ -1299,14 +1363,12 @@ mod tests {
                     )
                     .with_metadata_field(
                         &owned_value_path!("kubernetes_logs", "node_labels"),
-                        Kind::object(Collection::empty().with_unknown(Kind::bytes()))
-                            .or_undefined(),
+                        Kind::object(Collection::empty().with_unknown(Kind::bytes())).or_undefined(),
                         None
                     )
                     .with_metadata_field(
                         &owned_value_path!("kubernetes_logs", "pod_annotations"),
-                        Kind::object(Collection::empty().with_unknown(Kind::bytes()))
-                            .or_undefined(),
+                        Kind::object(Collection::empty().with_unknown(Kind::bytes())).or_undefined(),
                         None
                     )
                     .with_metadata_field(
@@ -1321,8 +1383,7 @@ mod tests {
                     )
                     .with_metadata_field(
                         &owned_value_path!("kubernetes_logs", "pod_labels"),
-                        Kind::object(Collection::empty().with_unknown(Kind::bytes()))
-                            .or_undefined(),
+                        Kind::object(Collection::empty().with_unknown(Kind::bytes())).or_undefined(),
                         None
                     )
                     .with_metadata_field(
@@ -1479,5 +1540,91 @@ mod tests {
                 )
             )
         )
+    }
+
+    #[test]
+    fn test_multiline_config_parsing() {
+        let config_str = r#"
+            self_node_name = "test-node"
+            
+            [multiline]
+            start_pattern = "^(INFO|ERROR)"
+            condition_pattern = "^\\s+"
+            mode = "continue_through"
+            timeout_ms = 1000
+        "#;
+        
+        let config: Config = toml::from_str(config_str).unwrap();
+        assert!(config.multiline.is_some());
+        let multiline = config.multiline.unwrap();
+        assert_eq!(multiline.start_pattern, "^(INFO|ERROR)");
+        assert_eq!(multiline.condition_pattern, "^\\s+");
+        assert_eq!(multiline.mode, line_agg::Mode::ContinueThrough);
+        assert_eq!(multiline.timeout_ms, Duration::from_millis(1000));
+    }
+
+    #[tokio::test]
+    async fn test_wrap_with_line_agg() {
+        // Create sample log lines mimicking stack traces
+        let lines = vec![
+            Line {
+                text: Bytes::from(r#"{"log":"ERROR Exception in thread \"main\" java.lang.NullPointerException\n","stream":"stdout","time":"2023-04-17T12:00:01.000000000Z"}"#),
+                filename: "test.log".to_string(),
+                file_id: FileFingerprint::Unknown(1),
+                start_offset: 0,
+                end_offset: 100,
+            },
+            Line {
+                text: Bytes::from(r#"{"log":"    at com.example.MyClass.method(MyClass.java:123)\n","stream":"stdout","time":"2023-04-17T12:00:01.000000001Z"}"#),
+                filename: "test.log".to_string(),
+                file_id: FileFingerprint::Unknown(1),
+                start_offset: 101,
+                end_offset: 200,
+            },
+            Line {
+                text: Bytes::from(r#"{"log":"    at com.example.MyClass.main(MyClass.java:45)\n","stream":"stdout","time":"2023-04-17T12:00:01.000000002Z"}"#),
+                filename: "test.log".to_string(),
+                file_id: FileFingerprint::Unknown(1),
+                start_offset: 201,
+                end_offset: 300,
+            },
+            Line {
+                text: Bytes::from(r#"{"log":"INFO Regular log message\n","stream":"stdout","time":"2023-04-17T12:00:02.000000000Z"}"#),
+                filename: "test.log".to_string(),
+                file_id: FileFingerprint::Unknown(1),
+                start_offset: 301,
+                end_offset: 400,
+            },
+        ];
+
+        // Create a test stream
+        let stream = futures::stream::iter(lines);
+        
+        // Create line_agg config 
+        let config = line_agg::Config {
+            start_pattern: regex::bytes::Regex::new(r#"^\{"log":"(INFO|ERROR)"#).unwrap(),
+            condition_pattern: regex::bytes::Regex::new(r#"^\{"log":"\s+"#).unwrap(),
+            mode: line_agg::Mode::ContinueThrough,
+            timeout: Duration::from_millis(1000),
+        };
+
+        // Apply the wrap_with_line_agg function
+        let aggregated = wrap_with_line_agg(stream, config);
+        
+        // Collect results
+        let results = aggregated.collect::<Vec<_>>().await;
+        
+        // Verify results: should have 2 lines instead of 4
+        assert_eq!(results.len(), 2);
+        
+        // First result should be the merged stack trace
+        let combined_text = String::from_utf8_lossy(&results[0].text);
+        assert!(combined_text.contains("ERROR Exception"));
+        assert!(combined_text.contains("at com.example.MyClass.method"));
+        assert!(combined_text.contains("at com.example.MyClass.main"));
+        
+        // Second result should be the standalone INFO message
+        let info_text = String::from_utf8_lossy(&results[1].text);
+        assert!(info_text.contains("INFO Regular log message"));
     }
 }
